@@ -1,165 +1,138 @@
 #!/bin/bash
 
-# Define Paths
-INSTALL_DIR="$HOME/.one-thing-sync"
-SYNC_SCRIPT="$INSTALL_DIR/sync.sh"
-UNINSTALL_SCRIPT="$INSTALL_DIR/uninstall.sh"
-URL_FILE="$INSTALL_DIR/url.txt"
-STATE_FILE="$INSTALL_DIR/state.txt"
+# --- PATHS ---
+INSTALL_ROOT="$HOME/.one-thing-sync"
+WORKER_SCRIPT="$INSTALL_ROOT/worker.sh"
+APP_NAME="OneThingSync.app"
+APP_PATH="$INSTALL_ROOT/$APP_NAME"
+CONFIG_FILE="$INSTALL_ROOT/config.txt"
+STATE_FILE="$INSTALL_ROOT/state.txt"
 PLIST_PATH="$HOME/Library/LaunchAgents/com.onething.sync.plist"
 
 # Colors
 GREEN='\033[0;32m'
 BLUE='\033[0;34m'
 RED='\033[0;31m'
+YELLOW='\033[1;33m'
 NC='\033[0m'
 
-echo -e "${BLUE}=== One Thing Sync Installer (Native) ===${NC}"
+echo -e "${BLUE}=== One Thing Sync Installer (Signed Applet) ===${NC}"
 
-# --- 1. DEPENDENCY CHECK (Just Python3) ---
-if ! command -v python3 &> /dev/null; then
-    echo -e "${RED}Error: Python 3 is missing (it should be on macOS by default).${NC}"
-    exit 1
-fi
+# 1. SETUP DIRS
+mkdir -p "$INSTALL_ROOT"
 
-mkdir -p "$INSTALL_DIR"
+# 2. CONFIGURATION
+if [ ! -f "$CONFIG_FILE" ]; then
+    echo -e "\n${GREEN}Configuration${NC}"
+    read -p "Bin ID: " -r BIN_ID < /dev/tty
+    read -p "Master Key: " -r API_KEY < /dev/tty
 
-# --- 2. CONFIGURATION ---
-echo -e "\n${GREEN}Sync Setup${NC}"
-SKIP_SETUP=false
+    BIN_ID=$(echo "$BIN_ID" | xargs)
+    API_KEY=$(echo "$API_KEY" | xargs)
 
-if [ -f "$URL_FILE" ]; then
-    EXISTING_URL=$(cat "$URL_FILE")
-    echo "Found existing sync URL: $EXISTING_URL"
-    echo "1) Keep existing"
-    echo "2) Overwrite/New"
-    read -p "Select option: " -r REPLACE_OPT < /dev/tty
-    if [[ "$REPLACE_OPT" == "1" ]]; then
-        SKIP_SETUP=true
-    fi
-fi
-
-if [ "$SKIP_SETUP" != "true" ]; then
-    echo "1) CREATE a new sync session (Host)"
-    echo "2) JOIN an existing session (Paste URL)"
-    read -p "Select option (1 or 2): " -r OPTION < /dev/tty
-
-    if [ "$OPTION" == "1" ]; then
-        echo "Creating storage bucket..."
-        # We use python to parse the JSON response to get the ID/URL cleanly if needed
-        # But JSONBlob POST returns the Location header.
-        SYNC_URL=$(curl -s -D - -o /dev/null -X POST -H "Content-Type: application/json" -d '{"text": "Sync Active"}' https://jsonblob.com/api/jsonBlob | grep -i "Location:" | awk '{print $2}' | tr -d '\r')
-
-        if [ -z "$SYNC_URL" ]; then
-            echo -e "${RED}Error contacting JSONBlob API.${NC}"
-            exit 1
-        fi
-
-        echo -e "${GREEN}Created!${NC}"
-        echo -e "---------------------------------------------------"
-        echo -e "YOUR SYNC URL: ${BLUE}$SYNC_URL${NC}"
-        echo -e "Send this URL to your friend."
-        echo -e "---------------------------------------------------"
-        echo "Press enter to continue..."
-        read -r DUMMY < /dev/tty
-    elif [ "$OPTION" == "2" ]; then
-        read -p "Paste the Sync URL here: " -r SYNC_URL < /dev/tty
-    else
-        echo "Invalid option."
+    if [ -z "$BIN_ID" ] || [ -z "$API_KEY" ]; then
+        echo -e "${RED}Error: Missing credentials.${NC}"
         exit 1
     fi
 
-    # Strip whitespace
-    SYNC_URL=$(echo "$SYNC_URL" | xargs)
-    echo "$SYNC_URL" > "$URL_FILE"
+    echo "$BIN_ID" > "$CONFIG_FILE"
+    echo "$API_KEY" >> "$CONFIG_FILE"
 fi
 
-# --- 3. GENERATE WORKER SCRIPT (Pure Bash + Python3) ---
-cat << 'EOF' > "$SYNC_SCRIPT"
+# 3. CREATE WORKER SCRIPT
+cat << 'EOF' > "$WORKER_SCRIPT"
 #!/bin/bash
-INSTALL_DIR="$HOME/.one-thing-sync"
-URL_FILE="$INSTALL_DIR/url.txt"
-STATE_FILE="$INSTALL_DIR/state.txt"
-
-# Environment setup for standard macOS paths
+INSTALL_ROOT="$HOME/.one-thing-sync"
+CONFIG_FILE="$INSTALL_ROOT/config.txt"
+STATE_FILE="$INSTALL_ROOT/state.txt"
 export PATH="/usr/bin:/bin:/usr/sbin:/sbin"
 
-if [ ! -f "$URL_FILE" ]; then exit 0; fi
-SYNC_URL=$(cat "$URL_FILE")
+if [ ! -f "$CONFIG_FILE" ]; then echo "Missing config"; exit 1; fi
+BIN_ID=$(sed '1q;d' "$CONFIG_FILE")
+API_KEY=$(sed '2q;d' "$CONFIG_FILE")
+SYNC_URL="https://api.jsonbin.io/v3/b/$BIN_ID"
 if [ ! -f "$STATE_FILE" ]; then touch "$STATE_FILE"; fi
 
-# --- HELPER FUNCTIONS (Python 3) ---
-
-# 1. READ LOCAL: defaults read -> python decode unicode
 get_local_text() {
-    # 'defaults read' might fail if empty, so we capture error
-    RAW=$(defaults read com.sindresorhus.One-Thing text 2>/dev/null || echo "")
-    # Python script to mimic the JS decodeUnicodeEscapes logic
-    python3 -c "import sys; print(sys.argv[1].encode('utf-8').decode('unicode_escape'))" "$RAW"
+    # Direct read via plutil (Allowed because parent app has FDA)
+    PLIST="$HOME/Library/Containers/com.sindresorhus.One-Thing/Data/Library/Preferences/com.sindresorhus.One-Thing.plist"
+    TEXT=$(plutil -extract text raw -o - "$PLIST" 2>/dev/null)
+    if [ -z "$TEXT" ]; then
+        TEXT=$(defaults read com.sindresorhus.One-Thing text 2>/dev/null)
+    fi
+    printf "%s" "$TEXT" | python3 -c "import sys; print(sys.stdin.read().encode('utf-8').decode('unicode_escape'))"
 }
 
-# 2. URL ENCODE
 url_encode() {
     python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1]))" "$1"
 }
 
-# 3. JSON PARSE
 get_remote_text() {
-    # curl -> python json parse
-    curl -s "$1" | python3 -c "import sys, json; print(json.load(sys.stdin).get('text', ''))"
+    curl -s -H "X-Master-Key: $API_KEY" "$SYNC_URL" \
+    | python3 -c "import sys, json; data = json.load(sys.stdin); print(data.get('record', {}).get('text', ''))"
 }
 
-# 4. JSON STRINGIFY (For pushing updates)
 create_json_payload() {
     python3 -c "import sys, json; print(json.dumps({'text': sys.argv[1]}))" "$1"
 }
 
-# --- EXECUTION ---
-
+echo "[$(date '+%H:%M:%S')] Checking..."
 LOCAL_TEXT=$(get_local_text)
-REMOTE_TEXT=$(get_remote_text "$SYNC_URL")
+REMOTE_TEXT=$(get_remote_text)
 LAST_KNOWN=$(cat "$STATE_FILE")
 
-# Handle possible nulls from empty JSON
 if [ "$REMOTE_TEXT" == "None" ]; then REMOTE_TEXT=""; fi
 
-# Debuging (Optional - comment out in prod)
-# echo "L: $LOCAL_TEXT | R: $REMOTE_TEXT | Last: $LAST_KNOWN"
+echo "  L: '$LOCAL_TEXT' | R: '$REMOTE_TEXT'"
 
-# --- SYNC LOGIC ---
-
-# Check if Local changed from Last Known -> Push
 if [ "$LOCAL_TEXT" != "$LAST_KNOWN" ] && [ ! -z "$LOCAL_TEXT" ]; then
-    # Don't push if it matches remote already (loop prevention)
     if [ "$LOCAL_TEXT" != "$REMOTE_TEXT" ]; then
+        echo "  -> Pushing..."
         PAYLOAD=$(create_json_payload "$LOCAL_TEXT")
-        curl -s -X PUT -H "Content-Type: application/json" -d "$PAYLOAD" "$SYNC_URL" > /dev/null
+        curl -s -X PUT -H "Content-Type: application/json" -H "X-Master-Key: $API_KEY" -d "$PAYLOAD" "$SYNC_URL" >/dev/null
     fi
     echo "$LOCAL_TEXT" > "$STATE_FILE"
-
-# Check if Remote changed from Last Known -> Pull
 elif [ "$REMOTE_TEXT" != "$LAST_KNOWN" ]; then
+    echo "  -> Pulling..."
     ENCODED=$(url_encode "$REMOTE_TEXT")
-    # Open URL scheme invisibly
     open --background "one-thing:?text=$ENCODED"
     echo "$REMOTE_TEXT" > "$STATE_FILE"
+else
+    echo "  -> No changes."
 fi
 EOF
+chmod +x "$WORKER_SCRIPT"
 
-chmod +x "$SYNC_SCRIPT"
+# 4. COMPILE APP
+echo -e "\n${BLUE}Compiling Applet...${NC}"
+# We use osacompile to create the wrapper
+osacompile -o "$APP_PATH" -e "do shell script \"$WORKER_SCRIPT\""
 
-# --- 4. GENERATE UNINSTALLER ---
-cat << EOF > "$UNINSTALL_SCRIPT"
-#!/bin/bash
-echo "Stopping background service..."
-launchctl unload "$PLIST_PATH" 2>/dev/null
-rm "$PLIST_PATH"
-rm -rf "$INSTALL_DIR"
-echo "One Thing Sync removed."
-EOF
-chmod +x "$UNINSTALL_SCRIPT"
+# 5. MODIFY PLIST (Hide from Dock + Set Name)
+# This prevents the 'applet' name and dock icon bouncing
+INFO_PLIST="$APP_PATH/Contents/Info.plist"
+plutil -replace LSUIElement -bool true "$INFO_PLIST"
+plutil -replace CFBundleName -string "OneThingSync" "$INFO_PLIST"
+plutil -replace CFBundleIdentifier -string "com.jpjagt.onethingsync" "$INFO_PLIST"
 
-# --- 5. REGISTER LAUNCH AGENT ---
+# 6. CODE SIGNING (The Fix for the 10s Prompt Loop)
+echo -e "${BLUE}Signing App...${NC}"
+codesign --force --deep --sign - "$APP_PATH"
+
+# 7. PERMISSION REQUEST
+echo -e "\n${YELLOW}=== ACTION REQUIRED ===${NC}"
+echo "1. Open System Settings > Privacy & Security > Full Disk Access."
+echo "2. Remove any existing 'applet' or 'OneThingSync' entries."
+echo "3. Drag the new app below into the list and turn it ON."
+open "$INSTALL_ROOT"
+open "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"
+
+echo -e "\n${GREEN}Press ENTER when permissions are set.${NC}"
+read -r DUMMY < /dev/tty
+
+# 8. LAUNCH AGENT
+APP_BINARY="$APP_PATH/Contents/MacOS/applet"
+
 cat << EOF > "$PLIST_PATH"
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -169,21 +142,21 @@ cat << EOF > "$PLIST_PATH"
     <string>com.onething.sync</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/bin/bash</string>
-        <string>$SYNC_SCRIPT</string>
+        <string>$APP_BINARY</string>
     </array>
     <key>StartInterval</key>
     <integer>5</integer>
     <key>RunAtLoad</key>
     <true/>
+    <key>StandardOutPath</key>
+    <string>/tmp/onething.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/onething.err</string>
 </dict>
 </plist>
 EOF
 
-# Reload Agent
 launchctl unload "$PLIST_PATH" 2>/dev/null
 launchctl load "$PLIST_PATH"
 
-echo -e "\n${GREEN}Installation Complete!${NC}"
-echo "Sync is running in the background."
-echo "To uninstall, run: $UNINSTALL_SCRIPT"
+echo -e "\n${GREEN}Done!${NC}"

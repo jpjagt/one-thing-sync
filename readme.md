@@ -1,26 +1,14 @@
 # One Thing Sync
 
-A zero-dependency sync tool for the macOS [One Thing](https://sindresorhus.com/one-thing) app.
+A secure sync tool for the macOS [One Thing](https://sindresorhus.com/one-thing) app.
 
-It keeps the text in your menu bar synced with a friend (or your other Mac).
+This tool creates a local "App Bundle" (`OneThingSync.app`) which runs in the background. You grant permissions specifically to this app, keeping your system secure.
 
-**Features:**
-- 🍎 Native. No Node.js, No Homebrew, No Plugins required.
-- ☁️ Uses a free, anonymous JSON store (JSONBlob).
-- 🔄 Updates every 5 seconds.
+## Prerequisites
+1. **macOS**
+2. **JSONBin Account** (Free) - Get your Bin ID and Master Key.
 
-## ⚡️ Quick Install
-
-Copy and paste this into your terminal:
+## Install
 
 ```bash
 bash <(curl -sL https://raw.githubusercontent.com/jpjagt/one-thing-sync/main/install.sh)
-```
-
-## Uninstall
-
-Run this in your terminal:
-
-```bash
-bash ~/.one-thing-sync/uninstall.sh
-```
