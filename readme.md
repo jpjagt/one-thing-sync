@@ -1,12 +1,13 @@
 # One Thing Sync
 
-A lightweight script to sync the [One Thing](https://sindresorhus.com/one-thing) menu bar app between friends or multiple Macs.
+A zero-dependency sync tool for the macOS [One Thing](https://sindresorhus.com/one-thing) app.
 
-It uses a free, anonymous JSON store to keep text in sync in real-time (checked every 5 seconds).
+It keeps the text in your menu bar synced with a friend (or your other Mac).
 
-## Prerequisites
-1. **macOS**
-2. **Node.js** (Install via [nodejs.org](https://nodejs.org) or `brew install node`)
+**Features:**
+- 🍎 Native. No Node.js, No Homebrew, No Plugins required.
+- ☁️ Uses a free, anonymous JSON store (JSONBlob).
+- 🔄 Updates every 5 seconds.
 
 ## ⚡️ Quick Install
 
@@ -14,3 +15,12 @@ Copy and paste this into your terminal:
 
 ```bash
 bash <(curl -sL https://raw.githubusercontent.com/jpjagt/one-thing-sync/main/install.sh)
+```
+
+## Uninstall
+
+Run this in your terminal:
+
+```bash
+bash ~/.one-thing-sync/uninstall.sh
+```

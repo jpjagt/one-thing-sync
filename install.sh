@@ -14,32 +14,19 @@ BLUE='\033[0;34m'
 RED='\033[0;31m'
 NC='\033[0m'
 
-echo -e "${BLUE}=== One Thing Sync Installer ===${NC}"
+echo -e "${BLUE}=== One Thing Sync Installer (Native) ===${NC}"
 
-# --- 1. DEPENDENCY CHECK ---
-echo "Checking dependencies..."
-
-if ! command -v node &> /dev/null; then
-    echo -e "${RED}Error: Node.js is not installed.${NC}"
-    echo "Please install Node.js (https://nodejs.org) and try again."
+# --- 1. DEPENDENCY CHECK (Just Python3) ---
+if ! command -v python3 &> /dev/null; then
+    echo -e "${RED}Error: Python 3 is missing (it should be on macOS by default).${NC}"
     exit 1
-fi
-
-if ! command -v jq &> /dev/null; then
-    echo "Installing jq (JSON processor)..."
-    brew install jq || { echo -e "${RED}Failed to install jq. Do you have Homebrew?${NC}"; exit 1; }
-fi
-
-if ! command -v one-thing &> /dev/null; then
-    echo "Installing 'one-thing' CLI tool..."
-    npm install --global one-thing || { echo -e "${RED}Failed to install npm package.${NC}"; exit 1; }
 fi
 
 mkdir -p "$INSTALL_DIR"
 
-# --- 2. CONFIGURATION (Interactive) ---
-# We force read from /dev/tty so this works even if the script is piped via curl
+# --- 2. CONFIGURATION ---
 echo -e "\n${GREEN}Sync Setup${NC}"
+SKIP_SETUP=false
 
 if [ -f "$URL_FILE" ]; then
     EXISTING_URL=$(cat "$URL_FILE")
@@ -59,7 +46,8 @@ if [ "$SKIP_SETUP" != "true" ]; then
 
     if [ "$OPTION" == "1" ]; then
         echo "Creating storage bucket..."
-        # Create blob and capture the Location header
+        # We use python to parse the JSON response to get the ID/URL cleanly if needed
+        # But JSONBlob POST returns the Location header.
         SYNC_URL=$(curl -s -D - -o /dev/null -X POST -H "Content-Type: application/json" -d '{"text": "Sync Active"}' https://jsonblob.com/api/jsonBlob | grep -i "Location:" | awk '{print $2}' | tr -d '\r')
 
         if [ -z "$SYNC_URL" ]; then
@@ -81,42 +69,83 @@ if [ "$SKIP_SETUP" != "true" ]; then
         exit 1
     fi
 
-    # Save URL
+    # Strip whitespace
+    SYNC_URL=$(echo "$SYNC_URL" | xargs)
     echo "$SYNC_URL" > "$URL_FILE"
 fi
 
-# --- 3. GENERATE WORKER SCRIPT ---
-# We write the script content to the install dir
+# --- 3. GENERATE WORKER SCRIPT (Pure Bash + Python3) ---
 cat << 'EOF' > "$SYNC_SCRIPT"
 #!/bin/bash
 INSTALL_DIR="$HOME/.one-thing-sync"
 URL_FILE="$INSTALL_DIR/url.txt"
 STATE_FILE="$INSTALL_DIR/state.txt"
-export PATH="$PATH:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
+# Environment setup for standard macOS paths
+export PATH="/usr/bin:/bin:/usr/sbin:/sbin"
 
 if [ ! -f "$URL_FILE" ]; then exit 0; fi
 SYNC_URL=$(cat "$URL_FILE")
 if [ ! -f "$STATE_FILE" ]; then touch "$STATE_FILE"; fi
 
-LOCAL_TEXT=$(one-thing --get 2>/dev/null || echo "")
-REMOTE_JSON=$(curl -s "$SYNC_URL")
-REMOTE_TEXT=$(echo "$REMOTE_JSON" | jq -r '.text')
+# --- HELPER FUNCTIONS (Python 3) ---
+
+# 1. READ LOCAL: defaults read -> python decode unicode
+get_local_text() {
+    # 'defaults read' might fail if empty, so we capture error
+    RAW=$(defaults read com.sindresorhus.One-Thing text 2>/dev/null || echo "")
+    # Python script to mimic the JS decodeUnicodeEscapes logic
+    python3 -c "import sys; print(sys.argv[1].encode('utf-8').decode('unicode_escape'))" "$RAW"
+}
+
+# 2. URL ENCODE
+url_encode() {
+    python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1]))" "$1"
+}
+
+# 3. JSON PARSE
+get_remote_text() {
+    # curl -> python json parse
+    curl -s "$1" | python3 -c "import sys, json; print(json.load(sys.stdin).get('text', ''))"
+}
+
+# 4. JSON STRINGIFY (For pushing updates)
+create_json_payload() {
+    python3 -c "import sys, json; print(json.dumps({'text': sys.argv[1]}))" "$1"
+}
+
+# --- EXECUTION ---
+
+LOCAL_TEXT=$(get_local_text)
+REMOTE_TEXT=$(get_remote_text "$SYNC_URL")
 LAST_KNOWN=$(cat "$STATE_FILE")
 
-if [ "$REMOTE_TEXT" == "null" ]; then REMOTE_TEXT=""; fi
+# Handle possible nulls from empty JSON
+if [ "$REMOTE_TEXT" == "None" ]; then REMOTE_TEXT=""; fi
 
-# Sync Logic
+# Debuging (Optional - comment out in prod)
+# echo "L: $LOCAL_TEXT | R: $REMOTE_TEXT | Last: $LAST_KNOWN"
+
+# --- SYNC LOGIC ---
+
+# Check if Local changed from Last Known -> Push
 if [ "$LOCAL_TEXT" != "$LAST_KNOWN" ] && [ ! -z "$LOCAL_TEXT" ]; then
+    # Don't push if it matches remote already (loop prevention)
     if [ "$LOCAL_TEXT" != "$REMOTE_TEXT" ]; then
-        JSON_PAYLOAD=$(jq -n --arg txt "$LOCAL_TEXT" '{text: $txt}')
-        curl -s -X PUT -H "Content-Type: application/json" -d "$JSON_PAYLOAD" "$SYNC_URL" > /dev/null
+        PAYLOAD=$(create_json_payload "$LOCAL_TEXT")
+        curl -s -X PUT -H "Content-Type: application/json" -d "$PAYLOAD" "$SYNC_URL" > /dev/null
     fi
     echo "$LOCAL_TEXT" > "$STATE_FILE"
+
+# Check if Remote changed from Last Known -> Pull
 elif [ "$REMOTE_TEXT" != "$LAST_KNOWN" ]; then
-    one-thing "$REMOTE_TEXT"
+    ENCODED=$(url_encode "$REMOTE_TEXT")
+    # Open URL scheme invisibly
+    open --background "one-thing:?text=$ENCODED"
     echo "$REMOTE_TEXT" > "$STATE_FILE"
 fi
 EOF
+
 chmod +x "$SYNC_SCRIPT"
 
 # --- 4. GENERATE UNINSTALLER ---
@@ -156,5 +185,5 @@ launchctl unload "$PLIST_PATH" 2>/dev/null
 launchctl load "$PLIST_PATH"
 
 echo -e "\n${GREEN}Installation Complete!${NC}"
-echo "You are now syncing."
+echo "Sync is running in the background."
 echo "To uninstall, run: $UNINSTALL_SCRIPT"
