@@ -3,8 +3,6 @@
 # --- PATHS ---
 INSTALL_ROOT="$HOME/.one-thing-sync"
 WORKER_SCRIPT="$INSTALL_ROOT/worker.sh"
-APP_NAME="OneThingSync.app"
-APP_PATH="$INSTALL_ROOT/$APP_NAME"
 CONFIG_FILE="$INSTALL_ROOT/config.txt"
 STATE_FILE="$INSTALL_ROOT/state.txt"
 PLIST_PATH="$HOME/Library/LaunchAgents/com.onething.sync.plist"
@@ -16,12 +14,26 @@ RED='\033[0;31m'
 YELLOW='\033[1;33m'
 NC='\033[0m'
 
-echo -e "${BLUE}=== One Thing Sync Installer (Signed Applet) ===${NC}"
+echo -e "${BLUE}=== One Thing Sync Installer ===${NC}"
 
-# 1. SETUP DIRS
+# 1. CLEANUP OLD INSTALLATION (preserve config)
+echo -e "\n${BLUE}Cleaning up old installation...${NC}"
+launchctl unload "$PLIST_PATH" 2>/dev/null
+rm -f "$PLIST_PATH"
+# Remove old files but keep config.txt
+rm -f "$INSTALL_ROOT/worker.sh"
+rm -f "$INSTALL_ROOT/worker.mjs"
+rm -f "$INSTALL_ROOT/worker.scpt"
+rm -f "$INSTALL_ROOT/run-node.sh"
+rm -f "$INSTALL_ROOT/onething-runner"
+rm -f "$INSTALL_ROOT/onething-node"
+rm -f "$INSTALL_ROOT/state.txt"
+rm -rf "$INSTALL_ROOT/OneThingSync.app"
+
+# 2. SETUP DIRS
 mkdir -p "$INSTALL_ROOT"
 
-# 2. CONFIGURATION
+# 3. CONFIGURATION
 if [ -f "$CONFIG_FILE" ]; then
     echo -e "\n${GREEN}Existing configuration found - keeping it.${NC}"
 else
@@ -41,7 +53,7 @@ else
     echo "$API_KEY" >> "$CONFIG_FILE"
 fi
 
-# 3. CREATE WORKER SCRIPT
+# 4. CREATE WORKER SCRIPT
 cat << 'EOF' > "$WORKER_SCRIPT"
 #!/bin/bash
 INSTALL_ROOT="$HOME/.one-thing-sync"
@@ -105,69 +117,40 @@ fi
 EOF
 chmod +x "$WORKER_SCRIPT"
 
-# 4. COMPILE APP
-echo -e "\n${BLUE}Compiling Applet...${NC}"
-# Create a temporary AppleScript file
-TEMP_SCRIPT="/tmp/onething_compile.applescript"
-cat > "$TEMP_SCRIPT" << 'APPLESCRIPT'
-on run
-    do shell script "~/.one-thing-sync/worker.sh"
-end run
-APPLESCRIPT
+# 5. CREATE DEDICATED RUNNER BINARY
+# Compile a tiny C program that just executes worker.sh
+# This avoids: applet control-key dialog, copying system binaries (gets killed)
+echo -e "\n${BLUE}Creating dedicated runner binary...${NC}"
+RUNNER_BIN="$INSTALL_ROOT/onething-runner"
 
-osacompile -o "$APP_PATH" "$TEMP_SCRIPT"
-rm "$TEMP_SCRIPT"
+cat << 'CCODE' > /tmp/onething-runner.c
+#include <unistd.h>
+int main(int argc, char *argv[]) {
+    if (argc < 2) return 1;
+    execv("/bin/bash", (char *[]){"/bin/bash", argv[1], NULL});
+    return 1;
+}
+CCODE
 
-# 5. MODIFY PLIST (Hide from Dock + Set Name)
-# This prevents the 'applet' name and dock icon bouncing
-INFO_PLIST="$APP_PATH/Contents/Info.plist"
-plutil -replace LSUIElement -bool true "$INFO_PLIST"
-plutil -replace CFBundleName -string "OneThingSync" "$INFO_PLIST"
-plutil -replace CFBundleIdentifier -string "com.jpjagt.onethingsync" "$INFO_PLIST"
-plutil -replace LSBackgroundOnly -bool true "$INFO_PLIST"
-plutil -replace NSAppleEventsUsageDescription -string "OneThingSync needs to run automation scripts" "$INFO_PLIST"
-# Prevent the "Run or Quit" startup screen
-plutil -replace NSAppleScriptEnabled -bool false "$INFO_PLIST" 2>/dev/null || plutil -insert NSAppleScriptEnabled -bool false "$INFO_PLIST"
-plutil -replace LSEnvironment -json '{"__OSASCRIPT_ENV":"1"}' "$INFO_PLIST" 2>/dev/null || plutil -insert LSEnvironment -json '{"__OSASCRIPT_ENV":"1"}' "$INFO_PLIST"
+cc -o "$RUNNER_BIN" /tmp/onething-runner.c
+rm /tmp/onething-runner.c
+codesign --force --sign - --identifier "com.jpjagt.onething-runner" "$RUNNER_BIN"
 
-# 6. FIX APPLET.RSRC PERMISSIONS (Prevents "Run or Quit" dialog)
-echo -e "${BLUE}Fixing applet.rsrc permissions...${NC}"
-RSRC_FILE="$APP_PATH/Contents/Resources/applet.rsrc"
-chmod +x "$RSRC_FILE"
-
-# Set the "spsh" resource bit to 00 (disable startup screen)
-# The second byte controls the startup dialog: 01=show, 00=hide
-# Find the spsh resource and change byte at offset 1 from 01 to 00
-if [ -f "$RSRC_FILE" ]; then
-    # Create a hex dump, find spsh, modify the byte, and write back
-    xxd -p "$RSRC_FILE" | tr -d '\n' > /tmp/rsrc.hex
-    # Replace the startup screen flag pattern (this is a bit hacky but works)
-    # Look for the spsh resource signature and change the control byte
-    sed -i '' 's/73707368000000010100/73707368000000010000/g' /tmp/rsrc.hex
-    xxd -r -p /tmp/rsrc.hex > "$RSRC_FILE"
-    rm /tmp/rsrc.hex
-fi
-
-# 6.5. CODE SIGNING (The Fix for the 10s Prompt Loop)
-echo -e "${BLUE}Signing App...${NC}"
-codesign --force --deep --sign - "$APP_PATH"
-
-# 7. PERMISSION REQUEST
+# 6. PERMISSION REQUEST
 echo -e "\n${YELLOW}=== ACTION REQUIRED ===${NC}"
-if [ -f "$STATE_FILE" ]; then
-    echo -e "${BLUE}The app was re-signed and needs Full Disk Access again.${NC}"
-fi
 echo "1. Open System Settings > Privacy & Security > Full Disk Access."
-echo "2. Remove any existing 'applet' or 'OneThingSync' entries."
-echo "3. Drag the new app below into the list and turn it ON."
+echo "2. Click '+' and navigate to: ~/.one-thing-sync/"
+echo "3. Select 'onething-runner' and turn it ON."
+echo ""
+echo "   (This is a dedicated binary just for this sync tool)"
 open "$INSTALL_ROOT"
 open "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"
 
 echo -e "\n${GREEN}Press ENTER when permissions are set.${NC}"
 read -r DUMMY < /dev/tty
 
-# 8. LAUNCH AGENT
-APP_BINARY="$APP_PATH/Contents/MacOS/applet"
+# 7. LAUNCH AGENT
+RUNNER_BIN="$INSTALL_ROOT/onething-runner"
 
 cat << EOF > "$PLIST_PATH"
 <?xml version="1.0" encoding="UTF-8"?>
@@ -178,7 +161,8 @@ cat << EOF > "$PLIST_PATH"
     <string>com.onething.sync</string>
     <key>ProgramArguments</key>
     <array>
-        <string>$APP_BINARY</string>
+        <string>$RUNNER_BIN</string>
+        <string>$WORKER_SCRIPT</string>
     </array>
     <key>StartInterval</key>
     <integer>5</integer>
