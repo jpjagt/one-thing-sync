@@ -22,7 +22,9 @@ echo -e "${BLUE}=== One Thing Sync Installer (Signed Applet) ===${NC}"
 mkdir -p "$INSTALL_ROOT"
 
 # 2. CONFIGURATION
-if [ ! -f "$CONFIG_FILE" ]; then
+if [ -f "$CONFIG_FILE" ]; then
+    echo -e "\n${GREEN}Existing configuration found - keeping it.${NC}"
+else
     echo -e "\n${GREEN}Configuration${NC}"
     read -p "Bin ID: " -r BIN_ID < /dev/tty
     read -p "Master Key: " -r API_KEY < /dev/tty
@@ -60,7 +62,7 @@ get_local_text() {
     if [ -z "$TEXT" ]; then
         TEXT=$(defaults read com.sindresorhus.One-Thing text 2>/dev/null)
     fi
-    printf "%s" "$TEXT" | python3 -c "import sys; print(sys.stdin.read().encode('utf-8').decode('unicode_escape'))"
+    printf "%s" "$TEXT"
 }
 
 url_encode() {
@@ -105,8 +107,16 @@ chmod +x "$WORKER_SCRIPT"
 
 # 4. COMPILE APP
 echo -e "\n${BLUE}Compiling Applet...${NC}"
-# We use osacompile to create the wrapper
-osacompile -o "$APP_PATH" -e "do shell script \"$WORKER_SCRIPT\""
+# Create a temporary AppleScript file
+TEMP_SCRIPT="/tmp/onething_compile.applescript"
+cat > "$TEMP_SCRIPT" << 'APPLESCRIPT'
+on run
+    do shell script "~/.one-thing-sync/worker.sh"
+end run
+APPLESCRIPT
+
+osacompile -o "$APP_PATH" "$TEMP_SCRIPT"
+rm "$TEMP_SCRIPT"
 
 # 5. MODIFY PLIST (Hide from Dock + Set Name)
 # This prevents the 'applet' name and dock icon bouncing
@@ -114,13 +124,39 @@ INFO_PLIST="$APP_PATH/Contents/Info.plist"
 plutil -replace LSUIElement -bool true "$INFO_PLIST"
 plutil -replace CFBundleName -string "OneThingSync" "$INFO_PLIST"
 plutil -replace CFBundleIdentifier -string "com.jpjagt.onethingsync" "$INFO_PLIST"
+plutil -replace LSBackgroundOnly -bool true "$INFO_PLIST"
+plutil -replace NSAppleEventsUsageDescription -string "OneThingSync needs to run automation scripts" "$INFO_PLIST"
+# Prevent the "Run or Quit" startup screen
+plutil -replace NSAppleScriptEnabled -bool false "$INFO_PLIST" 2>/dev/null || plutil -insert NSAppleScriptEnabled -bool false "$INFO_PLIST"
+plutil -replace LSEnvironment -json '{"__OSASCRIPT_ENV":"1"}' "$INFO_PLIST" 2>/dev/null || plutil -insert LSEnvironment -json '{"__OSASCRIPT_ENV":"1"}' "$INFO_PLIST"
 
-# 6. CODE SIGNING (The Fix for the 10s Prompt Loop)
+# 6. FIX APPLET.RSRC PERMISSIONS (Prevents "Run or Quit" dialog)
+echo -e "${BLUE}Fixing applet.rsrc permissions...${NC}"
+RSRC_FILE="$APP_PATH/Contents/Resources/applet.rsrc"
+chmod +x "$RSRC_FILE"
+
+# Set the "spsh" resource bit to 00 (disable startup screen)
+# The second byte controls the startup dialog: 01=show, 00=hide
+# Find the spsh resource and change byte at offset 1 from 01 to 00
+if [ -f "$RSRC_FILE" ]; then
+    # Create a hex dump, find spsh, modify the byte, and write back
+    xxd -p "$RSRC_FILE" | tr -d '\n' > /tmp/rsrc.hex
+    # Replace the startup screen flag pattern (this is a bit hacky but works)
+    # Look for the spsh resource signature and change the control byte
+    sed -i '' 's/73707368000000010100/73707368000000010000/g' /tmp/rsrc.hex
+    xxd -r -p /tmp/rsrc.hex > "$RSRC_FILE"
+    rm /tmp/rsrc.hex
+fi
+
+# 6.5. CODE SIGNING (The Fix for the 10s Prompt Loop)
 echo -e "${BLUE}Signing App...${NC}"
 codesign --force --deep --sign - "$APP_PATH"
 
 # 7. PERMISSION REQUEST
 echo -e "\n${YELLOW}=== ACTION REQUIRED ===${NC}"
+if [ -f "$STATE_FILE" ]; then
+    echo -e "${BLUE}The app was re-signed and needs Full Disk Access again.${NC}"
+fi
 echo "1. Open System Settings > Privacy & Security > Full Disk Access."
 echo "2. Remove any existing 'applet' or 'OneThingSync' entries."
 echo "3. Drag the new app below into the list and turn it ON."
@@ -152,6 +188,10 @@ cat << EOF > "$PLIST_PATH"
     <string>/tmp/onething.log</string>
     <key>StandardErrorPath</key>
     <string>/tmp/onething.err</string>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>LaunchOnlyOnce</key>
+    <false/>
 </dict>
 </plist>
 EOF
